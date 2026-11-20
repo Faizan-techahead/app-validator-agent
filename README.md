@@ -72,6 +72,7 @@ Chrome (recommended on Mac for SPA login). Either the `.app` bundle or the inner
 ```bash
 export CHROME_PATH="/Applications/Google Chrome.app"
 # or: export CHROME_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+export APP_VALIDATOR_HEADED=1   # visible Chrome window (default is headless)
 ```
 
 See Project doc `docs/mac-chrome-spa-login.md`. Without Chrome, curl still runs static HTML explore/login (no SPA form on Mizzou).
@@ -80,6 +81,7 @@ See Project doc `docs/mac-chrome-spa-login.md`. Without Chrome, curl still runs 
 export MIZZOU_USER='…'
 export MIZZOU_PASSWORD='…'
 export CHROME_PATH="/Applications/Google Chrome.app"
+export APP_VALIDATOR_HEADED=1
 # restart api after exporting so the server process sees the env
 curl -sS -X POST http://127.0.0.1:8788/v1/validate \
   -H "Authorization: Bearer $APP_VALIDATOR_API_TOKEN" \

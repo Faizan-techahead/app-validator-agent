@@ -5,7 +5,7 @@ import {
   type LoginAttemptResult,
   type ResolvedAuth,
 } from "./auth";
-import { findChromeBinary } from "./chrome";
+import { chromeProcessArgs, findChromeBinary, isChromeHeaded } from "./chrome";
 import { redactLogLines } from "./redact";
 import { captureAndroidScreenshot, captureChromeScreenshot, captureIosScreenshot } from "./screenshots";
 import { attemptSpaLogin } from "./spa-login";
@@ -111,24 +111,19 @@ function fetchPage(chrome: string | undefined, url: string): PageFetch {
       log: ["chrome=missing", ...fallback.log, "fallback=curl"],
     };
   }
+  const headed = isChromeHeaded();
   const result = spawnSync(
     chrome,
-    [
-      "--headless=new",
-      "--disable-gpu",
-      "--no-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-extensions",
-      "--no-first-run",
-      "--virtual-time-budget=3000",
-      "--timeout=10000",
+    chromeProcessArgs([
+      ...(headed ? [] : ["--virtual-time-budget=3000", "--timeout=10000"]),
       "--dump-dom",
       url,
-    ],
-    { encoding: "utf8", maxBuffer: 5_000_000, timeout: 20_000 },
+    ]),
+    { encoding: "utf8", maxBuffer: 5_000_000, timeout: headed ? 45_000 : 20_000 },
   );
   const chromeLog = [
     `chrome --dump-dom ${url}`,
+    `headed=${headed}`,
     `exit=${result.status}`,
     result.error ? `error=${result.error.message}` : "",
     result.stderr ? `stderr=${result.stderr.slice(0, 300)}` : "",

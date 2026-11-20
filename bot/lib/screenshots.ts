@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { chromeProcessArgs, isChromeHeaded } from "./chrome";
 
 export type ScreenshotCapture = {
   ok: true;
@@ -42,21 +43,16 @@ export function captureChromeScreenshot(
   const dir = mkdtempSync(join(tmpdir(), "app-validator-shot-"));
   const out = join(dir, "fail.png");
   try {
+    const headed = isChromeHeaded();
     const result = spawnSync(
       chrome,
-      [
-        "--headless=new",
-        "--disable-gpu",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-extensions",
-        "--no-first-run",
+      chromeProcessArgs([
         "--window-size=1280,720",
-        "--virtual-time-budget=3000",
+        ...(headed ? [] : ["--virtual-time-budget=3000"]),
         `--screenshot=${out}`,
         url,
-      ],
-      { encoding: "utf8", timeout: 12_000 },
+      ]),
+      { encoding: "utf8", timeout: headed ? 45_000 : 12_000 },
     );
     if (result.error) {
       return {

@@ -24,7 +24,11 @@ export async function attemptSpaLogin(
   mode: "valid" | "invalid",
 ): Promise<LoginAttemptResult & { via: "chrome-spa" | "unavailable" }> {
   const chrome = findChromeBinary();
-  const log: string[] = [`spa_login=start`, `auth_source=${auth.source}`];
+  const log: string[] = [
+    `spa_login=start`,
+    `auth_source=${auth.source}`,
+    `headed=${process.env.APP_VALIDATOR_HEADED ?? "0"}`,
+  ];
   if (!chrome) {
     return {
       ok: false,

@@ -36,6 +36,28 @@ export function resolveChromeExecutable(path: string): string | undefined {
   return undefined;
 }
 
+/** True when APP_VALIDATOR_HEADED is 1/true/yes — show a real Chrome window. */
+export function isChromeHeaded(): boolean {
+  const v = (process.env.APP_VALIDATOR_HEADED ?? "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "headed";
+}
+
+/** Shared Chrome flags; omits --headless=new when headed. */
+export function chromeProcessArgs(extra: string[]): string[] {
+  const headed = isChromeHeaded();
+  const base = [
+    ...(headed ? [] : ["--headless=new"]),
+    ...(headed ? [] : ["--disable-gpu"]),
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-extensions",
+    "--no-first-run",
+    "--window-size=1280,900",
+    ...extra,
+  ];
+  return base;
+}
+
 /** Resolve a Chrome/Chromium binary, including common macOS app paths. */
 export function findChromeBinary(): string | undefined {
   if (process.env.APP_VALIDATOR_FORCE_CURL === "1") return undefined;
@@ -127,22 +149,17 @@ async function waitForPageDebuggerUrl(port: number, timeoutMs: number): Promise<
   throw new Error(`Chrome page DevTools not ready on :${port} (${lastErr})`);
 }
 
-/** Launch headless Chrome with a CDP port for SPA automation. */
+/** Launch Chrome with a CDP port for SPA automation (headless by default; headed via APP_VALIDATOR_HEADED=1). */
 export async function launchChromeCdp(chromePath: string): Promise<CdpClient> {
   const port = 9200 + Math.floor(Math.random() * 600);
+  const headed = isChromeHeaded();
   const proc = spawn(
     chromePath,
-    [
-      "--headless=new",
-      "--disable-gpu",
-      "--no-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-extensions",
-      "--no-first-run",
-      "--window-size=1280,900",
+    chromeProcessArgs([
       `--remote-debugging-port=${port}`,
+      ...(headed ? ["--new-window"] : []),
       "about:blank",
-    ],
+    ]),
     { stdio: ["ignore", "ignore", "pipe"] },
   );
   try {
