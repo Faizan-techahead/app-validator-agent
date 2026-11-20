@@ -188,7 +188,7 @@ export async function runValidationPipeline(input: PipelineInput): Promise<Pipel
         platform: "web",
       };
     }
-    const web = runWebCases(base_url, catalog, { auth: resolvedAuth });
+    const web = await runWebCases(base_url, catalog, { auth: resolvedAuth });
     results = web.results;
     platformLabel = `web:${web.fetch_via ?? "unknown"}`;
   } else {

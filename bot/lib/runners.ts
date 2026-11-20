@@ -2,19 +2,45 @@ import { spawnSync } from "node:child_process";
 import {
   attemptFormLogin,
   fetchWithCookie,
+  type LoginAttemptResult,
   type ResolvedAuth,
 } from "./auth";
+import { findChromeBinary } from "./chrome";
 import { redactLogLines } from "./redact";
 import { captureAndroidScreenshot, captureChromeScreenshot, captureIosScreenshot } from "./screenshots";
+import { attemptSpaLogin } from "./spa-login";
 import type { CaseResult, FailureScreenshot, MobilePlatform, NormalizedCase } from "./types";
 
 function findChrome(): string | undefined {
-  if (process.env.APP_VALIDATOR_FORCE_CURL === "1") return undefined;
-  for (const bin of ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]) {
-    const which = spawnSync("which", [bin], { encoding: "utf8" });
-    if (which.status === 0 && which.stdout.trim()) return which.stdout.trim();
+  return findChromeBinary();
+}
+
+async function attemptLoginBestEffort(
+  baseUrl: string,
+  auth: ResolvedAuth,
+  mode: "valid" | "invalid",
+): Promise<LoginAttemptResult & { via?: string }> {
+  if (findChromeBinary()) {
+    const spa = await attemptSpaLogin(baseUrl, auth, mode);
+    if (spa.via === "chrome-spa") {
+      const shouldTryCurl =
+        !spa.ok &&
+        /no password input|could not fill|non-standard auth|failed to run|DevTools not ready|CDP WebSocket|SPA Chrome login failed/i.test(
+          spa.detail,
+        );
+      if (shouldTryCurl) {
+        const form = attemptFormLogin(baseUrl, auth, mode);
+        return {
+          ...form,
+          via: "curl-form",
+          log: redactLogLines([...spa.log, ...form.log, "fallback=curl-form"]),
+        };
+      }
+      return spa;
+    }
   }
-  return undefined;
+  const form = attemptFormLogin(baseUrl, auth, mode);
+  return { ...form, via: "curl-form" };
 }
 
 type PageFetch = {
@@ -270,16 +296,16 @@ function attachWebFailScreenshot(
   };
 }
 
-export function runWebCases(
+export async function runWebCases(
   base_url: string,
   cases: NormalizedCase[],
   opts?: { auth?: ResolvedAuth | null },
-): {
+): Promise<{
   ok: boolean;
   error?: string;
   fetch_via?: string;
   results: CaseResult[];
-} {
+}> {
   const chrome = findChrome();
 
   const cache = new Map<string, PageFetch>();
@@ -307,109 +333,135 @@ export function runWebCases(
   }
 
   let sessionCookie: string | undefined;
-  let validLogin: ReturnType<typeof attemptFormLogin> | undefined;
+  let validLogin: (LoginAttemptResult & { via?: string }) | undefined;
   const auth = opts?.auth ?? null;
+  const results: CaseResult[] = [];
 
-  const results = cases.map((c) => {
+  for (const c of cases) {
     const expected = (c.expected_result ?? "").trim();
     const targetUrl = urlFromSteps(c.steps, base_url);
 
     if (expected.startsWith("ASSERT:LOGIN_") || expected.startsWith("ASSERT:AUTH_") || expected === "ASSERT:LOGOUT_AFFORDANCE") {
       if (!auth) {
-        return {
+        results.push({
           test_id: c.test_id,
-          status: "blocked" as const,
+          status: "blocked",
           blocked_reason: "Auth case requires credentials via env/secret refs (never paste secrets into logs/PDF).",
           logs: redactLogLines([`case=${c.test_id}`, "status=blocked", "auth=missing"]),
-        };
+        });
+        continue;
       }
       if (expected === "ASSERT:LOGIN_VALID") {
-        validLogin = attemptFormLogin(base_url, auth, "valid");
+        validLogin = await attemptLoginBestEffort(base_url, auth, "valid");
         sessionCookie = validLogin.cookieHeader;
         const baseLogs = redactLogLines([
           ...validLogin.log,
           `case=${c.test_id}`,
           "assert=ASSERT:LOGIN_VALID",
+          `login_via=${validLogin.via ?? "unknown"}`,
         ]);
         if (validLogin.ok) {
-          return {
+          results.push({
             test_id: c.test_id,
-            status: "pass" as const,
+            status: "pass",
             evidence: [validLogin.detail],
             logs: [...baseLogs, "status=pass"],
-          };
+          });
+        } else {
+          results.push(
+            attachWebFailScreenshot(
+              {
+                test_id: c.test_id,
+                status: "fail",
+                evidence: [validLogin.htmlExcerpt].filter(Boolean),
+                failure_analysis: validLogin.detail,
+                logs: [...baseLogs, "status=fail"],
+                screenshot_blocked_reason:
+                  validLogin.via === "curl-form"
+                    ? "curl form-login; Chrome screenshot skipped."
+                    : undefined,
+              },
+              chrome,
+              auth.login_url || base_url,
+            ),
+          );
         }
-        return {
-          test_id: c.test_id,
-          status: "fail" as const,
-          evidence: [validLogin.htmlExcerpt].filter(Boolean),
-          failure_analysis: validLogin.detail,
-          logs: [...baseLogs, "status=fail"],
-          screenshot_blocked_reason: "Form-login explore uses curl; Chrome screenshot skipped.",
-        };
+        continue;
       }
       if (expected === "ASSERT:LOGIN_INVALID") {
-        const bad = attemptFormLogin(base_url, auth, "invalid");
-        const baseLogs = redactLogLines([...bad.log, `case=${c.test_id}`, "assert=ASSERT:LOGIN_INVALID"]);
+        const bad = await attemptLoginBestEffort(base_url, auth, "invalid");
+        const baseLogs = redactLogLines([
+          ...bad.log,
+          `case=${c.test_id}`,
+          "assert=ASSERT:LOGIN_INVALID",
+          `login_via=${bad.via ?? "unknown"}`,
+        ]);
         if (bad.ok) {
-          return {
+          results.push({
             test_id: c.test_id,
-            status: "pass" as const,
+            status: "pass",
             evidence: [bad.detail],
             logs: [...baseLogs, "status=pass"],
-          };
+          });
+        } else {
+          results.push({
+            test_id: c.test_id,
+            status: "fail",
+            failure_analysis: bad.detail,
+            logs: [...baseLogs, "status=fail"],
+            screenshot_blocked_reason:
+              bad.via === "curl-form" ? "curl form-login; Chrome screenshot skipped." : undefined,
+          });
         }
-        return {
-          test_id: c.test_id,
-          status: "fail" as const,
-          failure_analysis: bad.detail,
-          logs: [...baseLogs, "status=fail"],
-          screenshot_blocked_reason: "Form-login explore uses curl; Chrome screenshot skipped.",
-        };
+        continue;
       }
       if (!validLogin) {
-        validLogin = attemptFormLogin(base_url, auth, "valid");
+        validLogin = await attemptLoginBestEffort(base_url, auth, "valid");
         sessionCookie = validLogin.cookieHeader;
       }
       if (expected === "ASSERT:AUTH_SESSION") {
         const page = fetchWithCookie(base_url, sessionCookie);
         const baseLogs = redactLogLines([...page.log, `case=${c.test_id}`, "assert=ASSERT:AUTH_SESSION"]);
         const ok = page.ok && (page.httpCode ?? 200) < 400;
-        if (ok) {
-          return {
-            test_id: c.test_id,
-            status: "pass" as const,
-            evidence: [`Authenticated fetch of home returned HTTP ${page.httpCode ?? "ok"}.`],
-            logs: [...baseLogs, "status=pass"],
-          };
-        }
-        return {
-          test_id: c.test_id,
-          status: "fail" as const,
-          failure_analysis: "Authenticated session could not load home after login.",
-          logs: [...baseLogs, "status=fail"],
-        };
+        results.push(
+          ok
+            ? {
+                test_id: c.test_id,
+                status: "pass",
+                evidence: [`Authenticated fetch of home returned HTTP ${page.httpCode ?? "ok"}.`],
+                logs: [...baseLogs, "status=pass"],
+              }
+            : {
+                test_id: c.test_id,
+                status: "fail",
+                failure_analysis: "Authenticated session could not load home after login.",
+                logs: [...baseLogs, "status=fail"],
+              },
+        );
+        continue;
       }
       if (expected === "ASSERT:LOGOUT_AFFORDANCE") {
         const page = fetchWithCookie(base_url, sessionCookie);
         const html = page.html || validLogin?.htmlExcerpt || "";
         const baseLogs = redactLogLines([...page.log, `case=${c.test_id}`, "assert=ASSERT:LOGOUT_AFFORDANCE"]);
         const ok = /logout|sign[\s-]*out|log[\s-]*out/i.test(html);
-        if (ok) {
-          return {
-            test_id: c.test_id,
-            status: "pass" as const,
-            evidence: ["Found logout/sign-out affordance in authenticated HTML."],
-            logs: [...baseLogs, "status=pass"],
-          };
-        }
-        return {
-          test_id: c.test_id,
-          status: "fail" as const,
-          failure_analysis:
-            "No logout/sign-out affordance detected after login (SPA may hide it without JS).",
-          logs: [...baseLogs, "status=fail"],
-        };
+        results.push(
+          ok
+            ? {
+                test_id: c.test_id,
+                status: "pass",
+                evidence: ["Found logout/sign-out affordance in authenticated HTML."],
+                logs: [...baseLogs, "status=pass"],
+              }
+            : {
+                test_id: c.test_id,
+                status: "fail",
+                failure_analysis:
+                  "No logout/sign-out affordance detected after login (SPA may hide it without JS).",
+                logs: [...baseLogs, "status=fail"],
+              },
+        );
+        continue;
       }
     }
 
@@ -424,20 +476,22 @@ export function runWebCases(
       `fetch_via=${page.via}`,
     ]);
     if (c.app_type === "mobile") {
-      return {
+      results.push({
         test_id: c.test_id,
-        status: "not_run" as const,
+        status: "not_run",
         blocked_reason: "Case targets mobile; use mobile platform.",
         logs: [...baseLogs, "routed=mobile"],
-      };
+      });
+      continue;
     }
     if (!page.ok && !expected.startsWith("ASSERT:NOT_FOUND")) {
-      return {
+      results.push({
         test_id: c.test_id,
-        status: "blocked" as const,
+        status: "blocked",
         blocked_reason: `Could not load ${targetUrl}: ${page.error ?? "empty"}`,
         logs: [...baseLogs, "status=blocked"],
-      };
+      });
+      continue;
     }
     const navSteps = c.steps.filter(looksLikeNavStep);
     const actionable = c.steps.filter((s) => !looksLikeNavStep(s));
@@ -452,51 +506,57 @@ export function runWebCases(
     if (expected && verifyOnly) {
       const asserted = evalAssert(expected, page, homePage);
       if (asserted.pass) {
-        return {
+        results.push({
           test_id: c.test_id,
-          status: "pass" as const,
+          status: "pass",
           evidence: [...evidence, asserted.detail],
           logs: [...baseLogs, "status=pass", `assert=${expected}`, asserted.detail],
-        };
+        });
+      } else {
+        results.push(
+          attachWebFailScreenshot(
+            {
+              test_id: c.test_id,
+              status: "fail",
+              evidence,
+              failure_analysis: asserted.detail,
+              logs: [...baseLogs, "status=fail", `assert=${expected}`, asserted.detail],
+            },
+            chrome,
+            targetUrl,
+          ),
+        );
       }
-      return attachWebFailScreenshot(
-        {
-          test_id: c.test_id,
-          status: "fail",
-          evidence,
-          failure_analysis: asserted.detail,
-          logs: [...baseLogs, "status=fail", `assert=${expected}`, asserted.detail],
-        },
-        chrome,
-        targetUrl,
-      );
+      continue;
     }
     if (actionable.some((s) => /(click|type|enter|select|tap|fill|submit|login)/i.test(s))) {
-      return {
+      results.push({
         test_id: c.test_id,
-        status: "blocked" as const,
+        status: "blocked",
         evidence,
         blocked_reason:
           "Case requires interactive steps without explicit selectors in the sheet/brief. Do not invent UI.",
         logs: [...baseLogs, "status=blocked", "reason=interactive_without_selectors"],
-      };
+      });
+      continue;
     }
     if (!expected && navSteps.length > 0) {
-      return {
+      results.push({
         test_id: c.test_id,
-        status: "pass" as const,
+        status: "pass",
         evidence: [...evidence, "Navigation-only case; page loaded."],
         logs: [...baseLogs, "status=pass", "assert=nav_only"],
-      };
+      });
+      continue;
     }
-    return {
+    results.push({
       test_id: c.test_id,
-      status: "not_run" as const,
+      status: "not_run",
       evidence,
       blocked_reason: "Insufficient automation detail in steps/expected_result for Chrome execution.",
       logs: [...baseLogs, "status=not_run"],
-    };
-  });
+    });
+  }
 
   return { ok: true, fetch_via: homePage.via, results };
 }

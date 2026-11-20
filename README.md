@@ -65,7 +65,9 @@ curl -sS -X POST http://127.0.0.1:8788/v1/validate \
 ```
 
 URL + login via env refs (preferred — never put passwords in the JSON body or logs).
-Export credentials in the **same shell** as `npm run api` (or pass `login.username_env` / `password_env` in the body). Chrome is optional — curl fallback runs web + login explores without it.
+Export credentials in the **same shell** as `npm run api` (or pass `login.username_env` / `password_env` in the body).
+
+Chrome (recommended on Mac for SPA login): set `CHROME_PATH` if needed — see Project doc `docs/mac-chrome-spa-login.md`. Without Chrome, curl still runs static HTML explore/login.
 
 ```bash
 export MIZZOU_USER='…'
