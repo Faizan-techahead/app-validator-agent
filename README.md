@@ -64,11 +64,13 @@ curl -sS -X POST http://127.0.0.1:8788/v1/validate \
   }'
 ```
 
-URL + login via env refs (preferred — never put passwords in the JSON body or logs):
+URL + login via env refs (preferred — never put passwords in the JSON body or logs).
+Export credentials in the **same shell** as `npm run api` (or pass `login.username_env` / `password_env` in the body). Chrome is optional — curl fallback runs web + login explores without it.
 
 ```bash
 export MIZZOU_USER='…'
 export MIZZOU_PASSWORD='…'
+# restart api after exporting so the server process sees the env
 curl -sS -X POST http://127.0.0.1:8788/v1/validate \
   -H "Authorization: Bearer $APP_VALIDATOR_API_TOKEN" \
   -H 'content-type: application/json' \

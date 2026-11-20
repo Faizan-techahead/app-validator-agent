@@ -9,6 +9,7 @@ import { captureAndroidScreenshot, captureChromeScreenshot, captureIosScreenshot
 import type { CaseResult, FailureScreenshot, MobilePlatform, NormalizedCase } from "./types";
 
 function findChrome(): string | undefined {
+  if (process.env.APP_VALIDATOR_FORCE_CURL === "1") return undefined;
   for (const bin of ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]) {
     const which = spawnSync("which", [bin], { encoding: "utf8" });
     if (which.status === 0 && which.stdout.trim()) return which.stdout.trim();
@@ -69,7 +70,21 @@ function fetchViaCurl(url: string): Omit<PageFetch, "via"> & { via?: "curl" } {
   };
 }
 
-function fetchPage(chrome: string, url: string): PageFetch {
+function fetchPage(chrome: string | undefined, url: string): PageFetch {
+  if (!chrome) {
+    const fallback = fetchViaCurl(url);
+    return {
+      ok: fallback.ok,
+      excerpt: fallback.excerpt,
+      html: fallback.html,
+      httpCode: fallback.httpCode,
+      error: fallback.ok
+        ? "Chrome binary missing; used curl HTML fallback."
+        : fallback.error ?? "curl fetch failed",
+      via: "curl",
+      log: ["chrome=missing", ...fallback.log, "fallback=curl"],
+    };
+  }
   const result = spawnSync(
     chrome,
     [
@@ -122,7 +137,7 @@ function fetchPage(chrome: string, url: string): PageFetch {
     html: "",
     httpCode: fallback.httpCode,
     error: `Chrome: ${chromeError}; curl: ${fallback.error ?? "failed"}`,
-    via: "chrome",
+    via: "curl",
     log: [...chromeLog, ...fallback.log],
   };
 }
@@ -218,8 +233,22 @@ function evalAssert(
   }
 }
 
-function attachWebFailScreenshot(result: CaseResult, chrome: string, url: string): CaseResult {
+function attachWebFailScreenshot(
+  result: CaseResult,
+  chrome: string | undefined,
+  url: string,
+): CaseResult {
   if (result.status !== "fail") return result;
+  if (!chrome) {
+    return {
+      ...result,
+      screenshot_blocked_reason: "Chrome binary missing; curl fallback cannot capture screenshots.",
+      logs: redactLogLines([
+        ...(result.logs ?? []),
+        "screenshot=blocked reason=chrome_missing_curl_fallback",
+      ]),
+    };
+  }
   const shot = captureChromeScreenshot(chrome, url);
   if (shot.ok) {
     const screenshot: FailureScreenshot = {
@@ -252,18 +281,6 @@ export function runWebCases(
   results: CaseResult[];
 } {
   const chrome = findChrome();
-  if (!chrome) {
-    return {
-      ok: false,
-      error: "Chrome binary not found on this host.",
-      results: cases.map((c) => ({
-        test_id: c.test_id,
-        status: "blocked" as const,
-        blocked_reason: "Chrome binary not available on this worker.",
-        logs: redactLogLines([`chrome=missing`, `case=${c.test_id}`]),
-      })),
-    };
-  }
 
   const cache = new Map<string, PageFetch>();
   const getPage = (url: string): PageFetch => {

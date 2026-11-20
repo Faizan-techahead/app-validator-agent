@@ -22,19 +22,40 @@ export type ResolvedAuth = {
   source: "env" | "body";
 };
 
+const DEFAULT_USER_ENVS = ["MIZZOU_USER", "APP_VALIDATOR_USERNAME", "APP_UNDER_TEST_USER"];
+const DEFAULT_PASS_ENVS = ["MIZZOU_PASSWORD", "APP_VALIDATOR_PASSWORD", "APP_UNDER_TEST_PASSWORD"];
+
+function fromDefaultEnvs(login_url?: string): ResolvedAuth | null {
+  for (let i = 0; i < DEFAULT_USER_ENVS.length; i++) {
+    const userKey = DEFAULT_USER_ENVS[i]!;
+    const passKey = DEFAULT_PASS_ENVS[i]!;
+    const username = process.env[userKey];
+    const password = process.env[passKey];
+    if (username && password) {
+      return { login_url, username, password, source: "env" };
+    }
+  }
+  return null;
+}
+
 export function resolveAuth(input?: AuthInput | null): ResolvedAuth | null {
-  if (!input) return null;
+  if (!input) {
+    return fromDefaultEnvs();
+  }
   const userKey = input.username_env || input.username_secret_ref;
   const passKey = input.password_env || input.password_secret_ref;
   const username = (userKey ? process.env[userKey] : undefined) || input.username;
   const password = (passKey ? process.env[passKey] : undefined) || input.password;
-  if (!username || !password) return null;
-  return {
-    login_url: input.login_url,
-    username,
-    password,
-    source: userKey || passKey ? "env" : "body",
-  };
+  if (username && password) {
+    return {
+      login_url: input.login_url,
+      username,
+      password,
+      source: userKey || passKey ? "env" : "body",
+    };
+  }
+  // Partial login object still allows default env pair fallback.
+  return fromDefaultEnvs(input.login_url);
 }
 
 type FormFields = {
