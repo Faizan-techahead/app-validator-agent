@@ -1,0 +1,7 @@
+test_case_name,steps,expected_result,severity,app_type,test_id
+Home page loads,"1. Open base URL
+2. Verify page responds",Example Domain,critical,web,tc_home_loads
+Example heading visible,"1. Open base URL
+2. Check expected heading text is present",Example Domain,high,web,tc_heading_visible
+Missing slogan asserted,"1. Open base URL
+2. Verify slogan text",ThisSloganDoesNotExistOnExampleCom,medium,web,tc_missing_slogan

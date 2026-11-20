@@ -1,0 +1,12 @@
+{
+  "app_name": "Demo Catalog App",
+  "app_type": "web",
+  "base_url": "https://example.com",
+  "environments": [{ "name": "staging", "url": "https://example.com" }],
+  "roles": ["anonymous"],
+  "critical_flows": ["open home page", "verify page title presence"],
+  "auth_secret_refs": [],
+  "constraints": ["no login required for smoke"],
+  "in_scope": ["public home page reachability"],
+  "out_of_scope": ["authenticated checkout", "mobile install"]
+}
