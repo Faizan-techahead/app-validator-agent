@@ -42,7 +42,11 @@ export async function attemptSpaLogin(
   let client: Awaited<ReturnType<typeof launchChromeCdp>> | undefined;
   try {
     client = await launchChromeCdp(chrome);
-    log.push(`chrome=${chrome}`, `cdp_port=${client.port}`);
+    log.push(
+      `chrome=${chrome}`,
+      `cdp_port=${client.port}`,
+      `user_data_dir=${client.profileDir}`,
+    );
     await client.send("Page.enable");
     await client.send("Runtime.enable");
     await client.send("Network.enable");
@@ -139,7 +143,8 @@ export async function attemptSpaLogin(
       `document.documentElement?.outerHTML?.slice(0, 120000) || ''`,
     );
     const html = String(htmlRes.value ?? "");
-    const excerpt = html.replace(/\s+/g, " ").slice(0, 240);
+    // Keep enough DOM for auth-session evidence checks (no secrets in markup expected).
+    const excerpt = html.replace(/\s+/g, " ").slice(0, 4000);
     const urlRes = await cdpEvaluate(client, `location.href`);
     const finalUrl = String(urlRes.value ?? loginUrl);
     log.push(`final_url=${finalUrl}`);
@@ -167,26 +172,37 @@ export async function attemptSpaLogin(
 
     const success =
       looksLoggedIn(html) ||
-      (Boolean(cookieHeader) && !/type=["']password["']/i.test(html)) ||
-      finalUrl !== loginUrl;
+      (!/type=["']password["']/i.test(html) &&
+        Boolean(cookieHeader) &&
+        /dashboard|account|profile|welcome|home|mizzou/i.test(html));
     return {
       ok: success,
       via: "chrome-spa",
       detail: success
-        ? "SPA Chrome login produced post-login signals (URL/DOM/cookie)."
-        : "SPA Chrome login completed but success signals were not detected.",
+        ? "SPA Chrome login produced authenticated DOM/cookie signals."
+        : "SPA Chrome login completed but authenticated DOM signals were not detected.",
       cookieHeader,
       finalUrl,
       htmlExcerpt: excerpt,
       log: redactSecrets(log.join("\n")).split("\n"),
     };
   } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    const stderr = client?.stderrTail?.() ?? "";
     return {
       ok: false,
       via: "chrome-spa",
-      detail: `SPA Chrome login failed: ${e instanceof Error ? e.message : String(e)}`,
+      detail: `SPA Chrome login failed: ${msg}`,
       htmlExcerpt: "",
-      log: redactSecrets(log.concat(["spa_error=1"]).join("\n")).split("\n"),
+      log: redactSecrets(
+        log
+          .concat([
+            `spa_error=1`,
+            `error=${msg}`,
+            stderr ? `chrome_stderr=${stderr}` : "chrome_stderr=(empty)",
+          ])
+          .join("\n"),
+      ).split("\n"),
     };
   } finally {
     try {

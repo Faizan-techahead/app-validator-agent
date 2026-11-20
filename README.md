@@ -72,7 +72,7 @@ Chrome (recommended on Mac for SPA login). Either the `.app` bundle or the inner
 ```bash
 export CHROME_PATH="/Applications/Google Chrome.app"
 # or: export CHROME_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-export APP_VALIDATOR_HEADED=1   # visible Chrome window (default is headless)
+export APP_VALIDATOR_HEADED=1   # visible SPA login window only; dump-dom/screenshots stay headless
 ```
 
 See Project doc `docs/mac-chrome-spa-login.md`. Without Chrome, curl still runs static HTML explore/login (no SPA form on Mizzou).

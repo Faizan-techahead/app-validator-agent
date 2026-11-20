@@ -59,7 +59,8 @@ export function generateExploreCases(
     {
       test_id: "tc_explore_home_loads",
       test_case_name: "Home page loads",
-      steps: [`Open ${home}`],
+      steps: [`Open ${home}`, "Verify rendered login screen or app shell"],
+      expected_result: "ASSERT:APP_SHELL",
       severity: "critical",
       app_type: "web",
       source: "generated",

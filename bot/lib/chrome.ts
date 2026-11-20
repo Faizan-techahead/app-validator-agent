@@ -1,5 +1,6 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
 /** Inner MacOS binary names for common Chromium-family .app bundles. */
@@ -42,10 +43,17 @@ export function isChromeHeaded(): boolean {
   return v === "1" || v === "true" || v === "yes" || v === "headed";
 }
 
-/** Shared Chrome flags; omits --headless=new when headed. */
-export function chromeProcessArgs(extra: string[]): string[] {
-  const headed = isChromeHeaded();
-  const base = [
+/**
+ * Shared Chrome flags.
+ * - `headless` (default): always --headless=new — use for --dump-dom / --screenshot.
+ * - `interactive`: honors APP_VALIDATOR_HEADED for visible SPA/CDP sessions.
+ */
+export function chromeProcessArgs(
+  extra: string[],
+  mode: "headless" | "interactive" = "headless",
+): string[] {
+  const headed = mode === "interactive" && isChromeHeaded();
+  return [
     ...(headed ? [] : ["--headless=new"]),
     ...(headed ? [] : ["--disable-gpu"]),
     "--no-sandbox",
@@ -55,7 +63,6 @@ export function chromeProcessArgs(extra: string[]): string[] {
     "--window-size=1280,900",
     ...extra,
   ];
-  return base;
 }
 
 /** Resolve a Chrome/Chromium binary, including common macOS app paths. */
@@ -117,6 +124,9 @@ export type CdpClient = {
   close: () => void;
   proc: ChildProcess;
   port: number;
+  profileDir: string;
+  /** Accumulated Chrome stderr (startup / CDP failures). */
+  stderrTail: () => string;
 };
 
 function sleep(ms: number): Promise<void> {
@@ -153,17 +163,37 @@ async function waitForPageDebuggerUrl(port: number, timeoutMs: number): Promise<
 export async function launchChromeCdp(chromePath: string): Promise<CdpClient> {
   const port = 9200 + Math.floor(Math.random() * 600);
   const headed = isChromeHeaded();
+  // Chrome 136+ requires a non-default profile for remote debugging.
+  const profileDir = mkdtempSync(join(tmpdir(), "av-chrome-profile-"));
+  let stderr = "";
   const proc = spawn(
     chromePath,
-    chromeProcessArgs([
-      `--remote-debugging-port=${port}`,
-      ...(headed ? ["--new-window"] : []),
-      "about:blank",
-    ]),
+    chromeProcessArgs(
+      [
+        `--remote-debugging-port=${port}`,
+        `--user-data-dir=${profileDir}`,
+        ...(headed ? ["--new-window"] : []),
+        "about:blank",
+      ],
+      "interactive",
+    ),
     { stdio: ["ignore", "ignore", "pipe"] },
   );
+  proc.stderr?.on("data", (chunk: Buffer | string) => {
+    stderr += chunk.toString();
+    if (stderr.length > 8000) stderr = stderr.slice(-8000);
+  });
+  const stderrTail = () => stderr.replace(/\s+/g, " ").trim().slice(0, 600);
+  const wipeProfile = () => {
+    try {
+      rmSync(profileDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  };
+
   try {
-    const wsUrl = await waitForPageDebuggerUrl(port, 12_000);
+    const wsUrl = await waitForPageDebuggerUrl(port, 15_000);
     const ws = new WebSocket(wsUrl);
     await new Promise<void>((resolve, reject) => {
       const t = setTimeout(() => reject(new Error("CDP WebSocket connect timeout")), 10_000);
@@ -173,7 +203,7 @@ export async function launchChromeCdp(chromePath: string): Promise<CdpClient> {
       });
       ws.addEventListener("error", () => {
         clearTimeout(t);
-        reject(new Error("CDP WebSocket error"));
+        reject(new Error(`CDP WebSocket error${stderrTail() ? `; chrome_stderr=${stderrTail()}` : ""}`));
       });
     });
 
@@ -224,21 +254,26 @@ export async function launchChromeCdp(chromePath: string): Promise<CdpClient> {
       } catch {
         /* ignore */
       }
+      wipeProfile();
     };
 
     proc.on("exit", () => {
       for (const [, p] of pending) p.reject(new Error("Chrome exited"));
       pending.clear();
+      wipeProfile();
     });
 
-    return { send, close, proc, port };
+    return { send, close, proc, port, profileDir, stderrTail };
   } catch (e) {
+    const tip = stderrTail();
     try {
       proc.kill("SIGKILL");
     } catch {
       /* ignore */
     }
-    throw e;
+    wipeProfile();
+    const base = e instanceof Error ? e.message : String(e);
+    throw new Error(tip ? `${base}; chrome_stderr=${tip}` : base);
   }
 }
 

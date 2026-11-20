@@ -111,19 +111,19 @@ function fetchPage(chrome: string | undefined, url: string): PageFetch {
       log: ["chrome=missing", ...fallback.log, "fallback=curl"],
     };
   }
-  const headed = isChromeHeaded();
+  // dump-dom always headless so headed mode only affects interactive CDP sessions.
   const result = spawnSync(
     chrome,
-    chromeProcessArgs([
-      ...(headed ? [] : ["--virtual-time-budget=3000", "--timeout=10000"]),
-      "--dump-dom",
-      url,
-    ]),
-    { encoding: "utf8", maxBuffer: 5_000_000, timeout: headed ? 45_000 : 20_000 },
+    chromeProcessArgs(
+      ["--virtual-time-budget=5000", "--timeout=15000", "--dump-dom", url],
+      "headless",
+    ),
+    { encoding: "utf8", maxBuffer: 5_000_000, timeout: 25_000 },
   );
   const chromeLog = [
     `chrome --dump-dom ${url}`,
-    `headed=${headed}`,
+    `dump_mode=headless`,
+    `interactive_headed=${isChromeHeaded()}`,
     `exit=${result.status}`,
     result.error ? `error=${result.error.message}` : "",
     result.stderr ? `stderr=${result.stderr.slice(0, 300)}` : "",
@@ -190,6 +190,36 @@ function evalAssert(
       return title.length > 0
         ? { pass: true, detail: `title="${title.slice(0, 80)}"` }
         : { pass: false, detail: "No non-empty <title> found." };
+    }
+    case "ASSERT:APP_SHELL": {
+      const text = html
+        .replace(/<script[\s\S]*?<\/script>/gi, " ")
+        .replace(/<style[\s\S]*?<\/style>/gi, " ")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      const hasLoginUi =
+        /type=["']password["']/i.test(html) ||
+        /sign[\s-]*in|log[\s-]*in|email|password/i.test(html);
+      const hasAppRoot = /id=["'](root|app|__next|main)["']/i.test(html) || /data-reactroot/i.test(html);
+      const branded = /mizzou|virtualintros|virtual\s*intros/i.test(html);
+      const ok =
+        hasLoginUi ||
+        (hasAppRoot && text.length > 40) ||
+        (branded && text.length > 40) ||
+        text.length > 120;
+      return ok
+        ? {
+            pass: true,
+            detail: hasLoginUi
+              ? "Rendered login/app shell signals present."
+              : "Rendered app shell / branded content present.",
+          }
+        : {
+            pass: false,
+            detail:
+              "No rendered login screen or app shell evidence (empty SPA shell or failed DOM dump).",
+          };
     }
     case "ASSERT:HEADING_OR_MAIN": {
       const ok =
@@ -415,27 +445,67 @@ export async function runWebCases(
         sessionCookie = validLogin.cookieHeader;
       }
       if (expected === "ASSERT:AUTH_SESSION") {
+        if (!validLogin.ok) {
+          results.push({
+            test_id: c.test_id,
+            status: "blocked",
+            blocked_reason: "Skipped: valid login did not succeed, so session cannot be proven.",
+            logs: redactLogLines([
+              `case=${c.test_id}`,
+              "assert=ASSERT:AUTH_SESSION",
+              "status=blocked",
+              "reason=login_failed",
+            ]),
+          });
+          continue;
+        }
         const page = fetchWithCookie(base_url, sessionCookie);
-        const baseLogs = redactLogLines([...page.log, `case=${c.test_id}`, "assert=ASSERT:AUTH_SESSION"]);
-        const ok = page.ok && (page.httpCode ?? 200) < 400;
-        results.push(
-          ok
-            ? {
-                test_id: c.test_id,
-                status: "pass",
-                evidence: [`Authenticated fetch of home returned HTTP ${page.httpCode ?? "ok"}.`],
-                logs: [...baseLogs, "status=pass"],
-              }
-            : {
-                test_id: c.test_id,
-                status: "fail",
-                failure_analysis: "Authenticated session could not load home after login.",
-                logs: [...baseLogs, "status=fail"],
-              },
-        );
+        const html = `${validLogin.htmlExcerpt ?? ""}\n${page.html ?? ""}`;
+        const baseLogs = redactLogLines([
+          ...page.log,
+          `case=${c.test_id}`,
+          "assert=ASSERT:AUTH_SESSION",
+          `login_via=${validLogin.via ?? "unknown"}`,
+        ]);
+        const authed =
+          /logout|sign[\s-]*out|log[\s-]*out/i.test(html) ||
+          (/dashboard|my\s*account|profile|welcome|signed[\s-]*in|authenticated/i.test(html) &&
+            !/type=["']password["']/i.test(html));
+        if (authed) {
+          results.push({
+            test_id: c.test_id,
+            status: "pass",
+            evidence: [
+              "Post-login DOM shows authenticated-only signals (logout/account/dashboard), not merely HTTP 200.",
+            ],
+            logs: [...baseLogs, "status=pass"],
+          });
+        } else {
+          results.push({
+            test_id: c.test_id,
+            status: "fail",
+            failure_analysis:
+              "Login reported success but no authenticated-only indicator was found (public HTTP 200 alone is insufficient).",
+            logs: [...baseLogs, "status=fail"],
+          });
+        }
         continue;
       }
       if (expected === "ASSERT:LOGOUT_AFFORDANCE") {
+        if (!validLogin.ok) {
+          results.push({
+            test_id: c.test_id,
+            status: "blocked",
+            blocked_reason: "Skipped: valid login did not succeed.",
+            logs: redactLogLines([
+              `case=${c.test_id}`,
+              "assert=ASSERT:LOGOUT_AFFORDANCE",
+              "status=blocked",
+              "reason=login_failed",
+            ]),
+          });
+          continue;
+        }
         const page = fetchWithCookie(base_url, sessionCookie);
         const html = page.html || validLogin?.htmlExcerpt || "";
         const baseLogs = redactLogLines([...page.log, `case=${c.test_id}`, "assert=ASSERT:LOGOUT_AFFORDANCE"]);
