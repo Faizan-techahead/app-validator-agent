@@ -5,7 +5,8 @@
   "description": "agent project: app-validator",
   "scripts": {
     "check": "tsc --noEmit",
-    "dev": "agent-sdk dev"
+    "dev": "agent-sdk dev",
+    "api": "npx --yes tsx api/server.ts"
   },
   "dependencies": {
     "@grok/agent-sdk": "^0.7.0",

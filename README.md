@@ -7,12 +7,12 @@ Timestamps in reports use **Asia/Calcutta**.
 ## Clone and install
 
 ```bash
-git clone <YOUR_REMOTE_URL> app-validator
-cd app-validator
+git clone https://github.com/Faizan-techahead/app-validator-agent.git
+cd app-validator-agent
 npm install
 ```
 
-## Login (once per machine)
+## Login (once per machine, for playground / deploy)
 
 ```bash
 npx --yes "@grok/agent-sdk@0.7.0" login
@@ -35,32 +35,49 @@ Fixture smoke paths:
 - `evals/fixtures/sample-brief.json`
 - `evals/fixtures/sample-cases.xlsx`
 
+## HTTP API (ChatGPT Actions / scripts / other bots)
+
+Synchronous JSON + PDF for non-Cursor clients. Uses the same TypeScript pipeline as the agent tools (not a hosted 202 webhook).
+
+```bash
+cp env.example .env.local
+export APP_VALIDATOR_API_TOKEN='your-long-random-token'
+npm run api
+# http://127.0.0.1:8788/health
+# http://127.0.0.1:8788/openapi.json
+```
+
+```bash
+curl -sS -X POST http://127.0.0.1:8788/v1/validate \
+  -H "Authorization: Bearer $APP_VALIDATOR_API_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+    "brief": {
+      "app_name": "Demo Catalog App",
+      "app_type": "web",
+      "base_url": "https://example.com"
+    },
+    "platform": "web",
+    "sheet_path": "evals/fixtures/sample-cases.xlsx",
+    "pdf_mode": "path"
+  }'
+```
+
+Full OpenAPI-ish contract and Custom GPT setup: see the Project doc `docs/app-validator-http-api.md` (in the Planner Agent store) or ask the team for that path.
+
 ## Deploy (team hosting)
 
 Do this on a machine where you can keep the one-time **alias token** (password manager). Do **not** print the token in chat.
 
-1. Push the commit you want to ship to your git remote.
-2. Dry-run first:
-
 ```bash
 npx --yes "@grok/agent-sdk@0.7.0" validate --dir .
 npx --yes "@grok/agent-sdk@0.7.0" deploy --dir . --dry-run
-```
-
-3. Deploy for real (your terminal only):
-
-```bash
 npx --yes "@grok/agent-sdk@0.7.0" deploy --dir .
 ```
 
-4. Save the alias token from the first deploy. Manage the agent at  
-   https://cursor.com/dashboard/deployed-agents
+Manage at https://cursor.com/dashboard/deployed-agents
 
-5. Smoke a hosted session:
-
-```bash
-npx --yes "@grok/agent-sdk@0.7.0" session create --slug app-validator --message "Validate Demo Catalog App using the sample fixtures." --wait
-```
+The hosted Agent SDK deployment serves the playground/model agent. The **HTTP API** is run separately (`npm run api`) on a machine that can reach Chrome / emulators as needed.
 
 ## Tools
 
@@ -76,6 +93,6 @@ npx --yes "@grok/agent-sdk@0.7.0" session create --slug app-validator --message 
 
 ## Notes
 
-- Channels: playground + HTTP only (no Slack/Teams in this scaffold).
+- Channels: playground + HTTP agent routes; plus standalone `api/server.ts` for external callers.
 - Mobile execution and emulator screenshots belong on the self-hosted worker that hosts the emulator.
 - Never put passwords, tokens, or PII in Excel, chat, or the PDF.
