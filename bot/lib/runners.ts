@@ -1,4 +1,9 @@
 import { spawnSync } from "node:child_process";
+import {
+  attemptFormLogin,
+  fetchWithCookie,
+  type ResolvedAuth,
+} from "./auth";
 import { redactLogLines } from "./redact";
 import { captureAndroidScreenshot, captureChromeScreenshot, captureIosScreenshot } from "./screenshots";
 import type { CaseResult, FailureScreenshot, MobilePlatform, NormalizedCase } from "./types";
@@ -11,10 +16,21 @@ function findChrome(): string | undefined {
   return undefined;
 }
 
-function fetchViaCurl(url: string): { ok: boolean; excerpt: string; error?: string; log: string[] } {
+type PageFetch = {
+  ok: boolean;
+  excerpt: string;
+  html: string;
+  httpCode?: number;
+  error?: string;
+  via: "chrome" | "curl";
+  log: string[];
+};
+
+function fetchViaCurl(url: string): Omit<PageFetch, "via"> & { via?: "curl" } {
+  // Do not use -f: we need HTTP status for 404 exploratory cases.
   const result = spawnSync(
     "curl",
-    ["-fsSL", "--max-time", "15", "-A", "app-validator-chrome-fallback/1.0", "-w", "\nHTTP_CODE:%{http_code}", url],
+    ["-sSL", "--max-time", "15", "-A", "app-validator-chrome-fallback/1.0", "-w", "\nHTTP_CODE:%{http_code}", url],
     { encoding: "utf8", maxBuffer: 5_000_000 },
   );
   const log = [
@@ -23,12 +39,19 @@ function fetchViaCurl(url: string): { ok: boolean; excerpt: string; error?: stri
     result.stderr ? `stderr=${result.stderr.slice(0, 300)}` : "",
   ].filter(Boolean);
   if (result.error) {
-    return { ok: false, excerpt: "", error: result.error.message, log: [...log, result.error.message] };
+    return {
+      ok: false,
+      excerpt: "",
+      html: "",
+      error: result.error.message,
+      log: [...log, result.error.message],
+    };
   }
   if (result.status !== 0) {
     return {
       ok: false,
       excerpt: (result.stderr || "").slice(0, 500),
+      html: "",
       error: `curl exited ${result.status}`,
       log,
     };
@@ -36,20 +59,17 @@ function fetchViaCurl(url: string): { ok: boolean; excerpt: string; error?: stri
   const raw = result.stdout ?? "";
   const codeMatch = /HTTP_CODE:(\d+)\s*$/.exec(raw);
   const html = codeMatch ? raw.slice(0, codeMatch.index) : raw;
+  const httpCode = codeMatch ? Number(codeMatch[1]) : undefined;
   return {
-    ok: html.length > 0,
+    ok: html.length > 0 || (httpCode !== undefined && httpCode >= 100),
     excerpt: html.replace(/\s+/g, " ").slice(0, 1200),
-    log: [...log, `http_code=${codeMatch?.[1] ?? "unknown"}`, `body_bytes≈${html.length}`],
+    html: html.slice(0, 200_000),
+    httpCode,
+    log: [...log, `http_code=${httpCode ?? "unknown"}`, `body_bytes≈${html.length}`],
   };
 }
 
-function fetchPage(chrome: string, url: string): {
-  ok: boolean;
-  excerpt: string;
-  error?: string;
-  via: "chrome" | "curl";
-  log: string[];
-} {
+function fetchPage(chrome: string, url: string): PageFetch {
   const result = spawnSync(
     chrome,
     [
@@ -73,11 +93,13 @@ function fetchPage(chrome: string, url: string): {
     result.stderr ? `stderr=${result.stderr.slice(0, 300)}` : "",
   ].filter(Boolean);
   if (!result.error && result.status === 0 && (result.stdout ?? "").length > 0) {
+    const html = result.stdout ?? "";
     return {
       ok: true,
-      excerpt: (result.stdout ?? "").replace(/\s+/g, " ").slice(0, 1200),
+      excerpt: html.replace(/\s+/g, " ").slice(0, 1200),
+      html: html.slice(0, 200_000),
       via: "chrome",
-      log: [...chromeLog, `dom_bytes≈${(result.stdout ?? "").length}`],
+      log: [...chromeLog, `dom_bytes≈${html.length}`],
     };
   }
   const chromeError =
@@ -87,6 +109,8 @@ function fetchPage(chrome: string, url: string): {
     return {
       ok: true,
       excerpt: fallback.excerpt,
+      html: fallback.html,
+      httpCode: fallback.httpCode,
       error: `Chrome unavailable (${chromeError}); used curl HTML fallback.`,
       via: "curl",
       log: [...chromeLog, ...fallback.log, "fallback=curl"],
@@ -95,6 +119,8 @@ function fetchPage(chrome: string, url: string): {
   return {
     ok: false,
     excerpt: "",
+    html: "",
+    httpCode: fallback.httpCode,
     error: `Chrome: ${chromeError}; curl: ${fallback.error ?? "failed"}`,
     via: "chrome",
     log: [...chromeLog, ...fallback.log],
@@ -103,6 +129,93 @@ function fetchPage(chrome: string, url: string): {
 
 function looksLikeNavStep(step: string): boolean {
   return /^(open|goto|go to|navigate|visit|load)\b/i.test(step.trim());
+}
+
+function urlFromSteps(steps: string[], fallback: string): string {
+  for (const step of steps) {
+    if (!looksLikeNavStep(step)) continue;
+    const m = /\bhttps?:\/\/\S+/i.exec(step);
+    if (m) return m[0]!.replace(/[.,);]+$/, "");
+  }
+  return fallback;
+}
+
+function evalAssert(
+  kind: string,
+  page: PageFetch,
+  homePage?: PageFetch,
+): { pass: boolean; detail: string } {
+  const html = page.html || page.excerpt;
+  const lower = html.toLowerCase();
+  switch (kind) {
+    case "ASSERT:TITLE": {
+      const m = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html);
+      const title = (m?.[1] ?? "").replace(/\s+/g, " ").trim();
+      return title.length > 0
+        ? { pass: true, detail: `title="${title.slice(0, 80)}"` }
+        : { pass: false, detail: "No non-empty <title> found." };
+    }
+    case "ASSERT:HEADING_OR_MAIN": {
+      const ok =
+        /<h[1-6]\b/i.test(html) ||
+        /<main\b/i.test(html) ||
+        /role=["']main["']/i.test(html) ||
+        /<(article|section|header)\b/i.test(html) ||
+        (html.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<[^>]+>/g, " ").trim().length > 80);
+      return ok
+        ? { pass: true, detail: "Found heading/main landmark or substantial body text." }
+        : { pass: false, detail: "No heading/main landmark or substantial body text in DOM." };
+    }
+    case "ASSERT:NAV_OR_LINKS": {
+      const ok =
+        /<nav\b/i.test(html) ||
+        /role=["']navigation["']/i.test(html) ||
+        /<a\s+[^>]*href=/i.test(html) ||
+        /<button\b/i.test(html) ||
+        /role=["']button["']/i.test(html);
+      return ok
+        ? { pass: true, detail: "Found nav, links, or buttons." }
+        : { pass: false, detail: "No nav, links, or buttons found." };
+    }
+    case "ASSERT:NOT_FOUND_OR_ERROR": {
+      const code = page.httpCode;
+      if (code !== undefined && code >= 400) {
+        return { pass: true, detail: `HTTP ${code} for unknown path.` };
+      }
+      const notFoundish =
+        /\b404\b/i.test(html) ||
+        /not\s*found/i.test(html) ||
+        /page\s+doesn'?t\s+exist/i.test(html) ||
+        /does\s+not\s+exist/i.test(html);
+      if (notFoundish) {
+        return { pass: true, detail: "Body indicates not-found." };
+      }
+      // Soft SPA/CDN: unknown path must not look identical to home markup.
+      if (homePage?.html && page.html && page.html.replace(/\s+/g, "") === homePage.html.replace(/\s+/g, "")) {
+        return {
+          pass: false,
+          detail: "Unknown path returned the same markup as home (no 404 signal).",
+        };
+      }
+      if (code !== undefined && code >= 200 && code < 400) {
+        return {
+          pass: false,
+          detail: `Unknown path returned HTTP ${code} without a not-found signal.`,
+        };
+      }
+      return { pass: false, detail: "Could not confirm error/not-found for unknown path." };
+    }
+    default:
+      return {
+        pass:
+          lower.includes(kind.toLowerCase()) ||
+          kind
+            .toLowerCase()
+            .split(/\s+/)
+            .some((w) => w.length > 4 && lower.includes(w)),
+        detail: `Literal expected hint: ${kind}`,
+      };
+  }
 }
 
 function attachWebFailScreenshot(result: CaseResult, chrome: string, url: string): CaseResult {
@@ -128,7 +241,11 @@ function attachWebFailScreenshot(result: CaseResult, chrome: string, url: string
   };
 }
 
-export function runWebCases(base_url: string, cases: NormalizedCase[]): {
+export function runWebCases(
+  base_url: string,
+  cases: NormalizedCase[],
+  opts?: { auth?: ResolvedAuth | null },
+): {
   ok: boolean;
   error?: string;
   fetch_via?: string;
@@ -148,28 +265,145 @@ export function runWebCases(base_url: string, cases: NormalizedCase[]): {
     };
   }
 
-  const page = fetchPage(chrome, base_url);
-  if (!page.ok) {
+  const cache = new Map<string, PageFetch>();
+  const getPage = (url: string): PageFetch => {
+    const hit = cache.get(url);
+    if (hit) return hit;
+    const page = fetchPage(chrome, url);
+    cache.set(url, page);
+    return page;
+  };
+
+  const homePage = getPage(base_url);
+  if (!homePage.ok) {
     return {
       ok: false,
-      error: page.error ?? "Failed to load base_url.",
-      fetch_via: page.via,
+      error: homePage.error ?? "Failed to load base_url.",
+      fetch_via: homePage.via,
       results: cases.map((c) => ({
         test_id: c.test_id,
         status: "blocked" as const,
-        blocked_reason: `Could not load ${base_url}: ${page.error ?? "empty DOM"}`,
-        logs: redactLogLines([...page.log, `case=${c.test_id}`, "status=blocked"]),
+        blocked_reason: `Could not load ${base_url}: ${homePage.error ?? "empty DOM"}`,
+        logs: redactLogLines([...homePage.log, `case=${c.test_id}`, "status=blocked"]),
       })),
     };
   }
 
+  let sessionCookie: string | undefined;
+  let validLogin: ReturnType<typeof attemptFormLogin> | undefined;
+  const auth = opts?.auth ?? null;
+
   const results = cases.map((c) => {
+    const expected = (c.expected_result ?? "").trim();
+    const targetUrl = urlFromSteps(c.steps, base_url);
+
+    if (expected.startsWith("ASSERT:LOGIN_") || expected.startsWith("ASSERT:AUTH_") || expected === "ASSERT:LOGOUT_AFFORDANCE") {
+      if (!auth) {
+        return {
+          test_id: c.test_id,
+          status: "blocked" as const,
+          blocked_reason: "Auth case requires credentials via env/secret refs (never paste secrets into logs/PDF).",
+          logs: redactLogLines([`case=${c.test_id}`, "status=blocked", "auth=missing"]),
+        };
+      }
+      if (expected === "ASSERT:LOGIN_VALID") {
+        validLogin = attemptFormLogin(base_url, auth, "valid");
+        sessionCookie = validLogin.cookieHeader;
+        const baseLogs = redactLogLines([
+          ...validLogin.log,
+          `case=${c.test_id}`,
+          "assert=ASSERT:LOGIN_VALID",
+        ]);
+        if (validLogin.ok) {
+          return {
+            test_id: c.test_id,
+            status: "pass" as const,
+            evidence: [validLogin.detail],
+            logs: [...baseLogs, "status=pass"],
+          };
+        }
+        return {
+          test_id: c.test_id,
+          status: "fail" as const,
+          evidence: [validLogin.htmlExcerpt].filter(Boolean),
+          failure_analysis: validLogin.detail,
+          logs: [...baseLogs, "status=fail"],
+          screenshot_blocked_reason: "Form-login explore uses curl; Chrome screenshot skipped.",
+        };
+      }
+      if (expected === "ASSERT:LOGIN_INVALID") {
+        const bad = attemptFormLogin(base_url, auth, "invalid");
+        const baseLogs = redactLogLines([...bad.log, `case=${c.test_id}`, "assert=ASSERT:LOGIN_INVALID"]);
+        if (bad.ok) {
+          return {
+            test_id: c.test_id,
+            status: "pass" as const,
+            evidence: [bad.detail],
+            logs: [...baseLogs, "status=pass"],
+          };
+        }
+        return {
+          test_id: c.test_id,
+          status: "fail" as const,
+          failure_analysis: bad.detail,
+          logs: [...baseLogs, "status=fail"],
+          screenshot_blocked_reason: "Form-login explore uses curl; Chrome screenshot skipped.",
+        };
+      }
+      if (!validLogin) {
+        validLogin = attemptFormLogin(base_url, auth, "valid");
+        sessionCookie = validLogin.cookieHeader;
+      }
+      if (expected === "ASSERT:AUTH_SESSION") {
+        const page = fetchWithCookie(base_url, sessionCookie);
+        const baseLogs = redactLogLines([...page.log, `case=${c.test_id}`, "assert=ASSERT:AUTH_SESSION"]);
+        const ok = page.ok && (page.httpCode ?? 200) < 400;
+        if (ok) {
+          return {
+            test_id: c.test_id,
+            status: "pass" as const,
+            evidence: [`Authenticated fetch of home returned HTTP ${page.httpCode ?? "ok"}.`],
+            logs: [...baseLogs, "status=pass"],
+          };
+        }
+        return {
+          test_id: c.test_id,
+          status: "fail" as const,
+          failure_analysis: "Authenticated session could not load home after login.",
+          logs: [...baseLogs, "status=fail"],
+        };
+      }
+      if (expected === "ASSERT:LOGOUT_AFFORDANCE") {
+        const page = fetchWithCookie(base_url, sessionCookie);
+        const html = page.html || validLogin?.htmlExcerpt || "";
+        const baseLogs = redactLogLines([...page.log, `case=${c.test_id}`, "assert=ASSERT:LOGOUT_AFFORDANCE"]);
+        const ok = /logout|sign[\s-]*out|log[\s-]*out/i.test(html);
+        if (ok) {
+          return {
+            test_id: c.test_id,
+            status: "pass" as const,
+            evidence: ["Found logout/sign-out affordance in authenticated HTML."],
+            logs: [...baseLogs, "status=pass"],
+          };
+        }
+        return {
+          test_id: c.test_id,
+          status: "fail" as const,
+          failure_analysis:
+            "No logout/sign-out affordance detected after login (SPA may hide it without JS).",
+          logs: [...baseLogs, "status=fail"],
+        };
+      }
+    }
+
+    const page = getPage(targetUrl);
     const baseLogs = redactLogLines([
       ...page.log,
       `case=${c.test_id}`,
       `name=${c.test_case_name}`,
+      `url=${targetUrl}`,
       `steps=${c.steps.join(" | ")}`,
-      `expected=${c.expected_result ?? ""}`,
+      `expected=${expected}`,
       `fetch_via=${page.via}`,
     ]);
     if (c.app_type === "mobile") {
@@ -180,29 +414,32 @@ export function runWebCases(base_url: string, cases: NormalizedCase[]): {
         logs: [...baseLogs, "routed=mobile"],
       };
     }
+    if (!page.ok && !expected.startsWith("ASSERT:NOT_FOUND")) {
+      return {
+        test_id: c.test_id,
+        status: "blocked" as const,
+        blocked_reason: `Could not load ${targetUrl}: ${page.error ?? "empty"}`,
+        logs: [...baseLogs, "status=blocked"],
+      };
+    }
     const navSteps = c.steps.filter(looksLikeNavStep);
     const actionable = c.steps.filter((s) => !looksLikeNavStep(s));
     const evidence = [
-      `Loaded ${base_url} via ${page.via}`,
+      `Loaded ${targetUrl} via ${page.via}${page.httpCode ? ` HTTP ${page.httpCode}` : ""}`,
       `DOM excerpt: ${page.excerpt.slice(0, 120)}`,
       ...(page.error ? [page.error] : []),
     ];
-    const expected = (c.expected_result ?? "").trim();
     const verifyOnly =
       actionable.length === 0 ||
-      actionable.every((s) => /verify|assert|check|see|confirm/i.test(s));
+      actionable.every((s) => /verify|assert|check|see|confirm|submit/i.test(s));
     if (expected && verifyOnly) {
-      const needle = expected.toLowerCase();
-      const hay = page.excerpt.toLowerCase();
-      const matched =
-        hay.includes(needle) ||
-        needle.split(/\s+/).some((w) => w.length > 4 && hay.includes(w));
-      if (matched) {
+      const asserted = evalAssert(expected, page, homePage);
+      if (asserted.pass) {
         return {
           test_id: c.test_id,
           status: "pass" as const,
-          evidence: [...evidence, `Expected hint matched: ${expected}`],
-          logs: [...baseLogs, "status=pass", "assert=matched"],
+          evidence: [...evidence, asserted.detail],
+          logs: [...baseLogs, "status=pass", `assert=${expected}`, asserted.detail],
         };
       }
       return attachWebFailScreenshot(
@@ -210,11 +447,11 @@ export function runWebCases(base_url: string, cases: NormalizedCase[]): {
           test_id: c.test_id,
           status: "fail",
           evidence,
-          failure_analysis: `Expected result text not found in page DOM excerpt: "${expected}"`,
-          logs: [...baseLogs, "status=fail", "assert=missing_expected"],
+          failure_analysis: asserted.detail,
+          logs: [...baseLogs, "status=fail", `assert=${expected}`, asserted.detail],
         },
         chrome,
-        base_url,
+        targetUrl,
       );
     }
     if (actionable.some((s) => /(click|type|enter|select|tap|fill|submit|login)/i.test(s))) {
@@ -244,7 +481,7 @@ export function runWebCases(base_url: string, cases: NormalizedCase[]): {
     };
   });
 
-  return { ok: true, fetch_via: page.via, results };
+  return { ok: true, fetch_via: homePage.via, results };
 }
 
 function runCmd(cmd: string, args: string[]): { ok: boolean; stdout: string; stderr: string } {

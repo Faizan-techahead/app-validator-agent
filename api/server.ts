@@ -7,6 +7,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { timingSafeEqual } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import type { AuthInput } from "../bot/lib/auth";
 import { runValidationPipeline } from "../bot/lib/pipeline";
 import type { ApplicationBrief, ColumnMapping, MobilePlatform } from "../bot/lib/types";
 import { redactSecrets } from "../bot/lib/redact";
@@ -26,6 +27,9 @@ type ValidateBody = {
   column_mapping?: ColumnMapping;
   environment?: string;
   pdf_mode?: "base64" | "path" | "both";
+  /** Prefer username_env/password_env (e.g. MIZZOU_USER / MIZZOU_PASSWORD). */
+  login?: AuthInput;
+  auth?: AuthInput;
 };
 
 function logLine(msg: string): void {
@@ -136,13 +140,31 @@ function openApiDoc() {
             brief: { type: "object", description: "Application brief" },
             platform: { type: "string", enum: ["web", "mobile"] },
             mobile_os: { type: "string", enum: ["android", "ios"] },
-            sheet_path: { type: "string" },
+            sheet_path: {
+              type: "string",
+              description: "Optional. If omitted with no gap_cases, exploratory URL cases are auto-generated from brief.base_url.",
+            },
             sheet_url: { type: "string", format: "uri" },
             sheet_base64: { type: "string", description: "Raw file bytes, base64" },
             sheet_filename: { type: "string", example: "cases.xlsx" },
             column_mapping: { type: "object" },
             environment: { type: "string" },
             pdf_mode: { type: "string", enum: ["base64", "path", "both"], default: "both" },
+            login: {
+              type: "object",
+              description:
+                "Optional credentials. Prefer username_env/password_env (e.g. MIZZOU_USER/MIZZOU_PASSWORD). Plaintext username/password accepted but never logged or written to PDF.",
+              properties: {
+                login_url: { type: "string" },
+                username_env: { type: "string", example: "MIZZOU_USER" },
+                password_env: { type: "string", example: "MIZZOU_PASSWORD" },
+                username_secret_ref: { type: "string" },
+                password_secret_ref: { type: "string" },
+                username: { type: "string" },
+                password: { type: "string" },
+              },
+            },
+            auth: { type: "object", description: "Alias for login" },
           },
         },
         ValidateResponse: {
@@ -221,7 +243,18 @@ async function handleValidate(req: IncomingMessage, res: ServerResponse): Promis
     return;
   }
 
-  logLine(`validate start platform=${body.platform ?? body.brief.app_type} sheet=${sheet_path ? "yes" : "no"}`);
+  const login = body.login ?? body.auth;
+  const hasLoginRefs = Boolean(
+    login?.username_env ||
+      login?.password_env ||
+      login?.username_secret_ref ||
+      login?.password_secret_ref ||
+      login?.username ||
+      login?.password,
+  );
+  logLine(
+    `validate start platform=${body.platform ?? body.brief.app_type} sheet=${sheet_path ? "yes" : "no"} login=${hasLoginRefs ? "yes" : "no"}`,
+  );
   const result = await runValidationPipeline({
     brief: body.brief,
     platform: body.platform,
@@ -230,6 +263,7 @@ async function handleValidate(req: IncomingMessage, res: ServerResponse): Promis
     column_mapping: body.column_mapping,
     environment: body.environment,
     pdf_mode: body.pdf_mode ?? "both",
+    login,
   });
 
   if (!result.ok) {

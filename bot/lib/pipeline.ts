@@ -1,6 +1,8 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { resolveAuth, type AuthInput } from "./auth";
 import { validateBrief } from "./brief";
+import { generateExploreCases } from "./explore-cases";
 import { loadTabularFile, rowsToCases } from "./excel";
 import { fingerprintPayload, nowIstIso, renderValidationPdf } from "./pdf";
 import { resolveSafePath } from "./paths";
@@ -28,6 +30,10 @@ export type PipelineInput = {
   gap_cases?: NormalizedCase[];
   pdf_mode?: "base64" | "path" | "both";
   output_dir?: string;
+  /** Prefer env/secret refs. Plaintext never logged or written into PDF text. */
+  auth?: AuthInput;
+  /** Alias for `auth` (HTTP API `login` field). */
+  login?: AuthInput;
 };
 
 export type PipelineResult = {
@@ -141,19 +147,32 @@ export async function runValidationPipeline(input: PipelineInput): Promise<Pipel
     }
   }
 
-  const catalog = mergeCatalog(excelCases, input.gap_cases ?? []);
+  const route: "web" | "mobile" =
+    input.platform ??
+    (brief.app_type === "mobile" ? "mobile" : brief.app_type === "hybrid" ? "web" : "web");
+
+  const resolvedAuth = resolveAuth(input.auth ?? input.login);
+
+  let gapCases = input.gap_cases ?? [];
+  if (excelCases.length === 0 && gapCases.length === 0) {
+    gapCases = generateExploreCases(brief, {
+      platform: route,
+      mobile_os: input.mobile_os,
+      withAuth: Boolean(resolvedAuth),
+      login_url: resolvedAuth?.login_url ?? input.login?.login_url ?? input.auth?.login_url,
+    });
+  }
+
+  const catalog = mergeCatalog(excelCases, gapCases);
   if (catalog.length === 0) {
     return {
       ok: false,
-      error: "No test cases. Provide sheet_path or gap_cases.",
+      error:
+        "No test cases. Provide sheet_path, or a web brief with base_url (auto-explore), or gap_cases.",
       run_id: `run_${Date.now()}`,
       platform: input.platform ?? brief.app_type,
     };
   }
-
-  const route: "web" | "mobile" =
-    input.platform ??
-    (brief.app_type === "mobile" ? "mobile" : brief.app_type === "hybrid" ? "web" : "web");
 
   let results: CaseResult[] = [];
   let platformLabel: string = route;
@@ -169,7 +188,7 @@ export async function runValidationPipeline(input: PipelineInput): Promise<Pipel
         platform: "web",
       };
     }
-    const web = runWebCases(base_url, catalog);
+    const web = runWebCases(base_url, catalog, { auth: resolvedAuth });
     results = web.results;
     platformLabel = `web:${web.fetch_via ?? "unknown"}`;
   } else {

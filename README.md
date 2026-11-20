@@ -47,6 +47,48 @@ npm run api
 # http://127.0.0.1:8788/openapi.json
 ```
 
+Brief only (no Excel) — auto-generates generic exploratory web cases from `base_url`:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8788/v1/validate \
+  -H "Authorization: Bearer $APP_VALIDATOR_API_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+    "brief": {
+      "app_name": "Mizzou",
+      "app_type": "web",
+      "base_url": "https://mizzou-stage-web.virtualintros.com/"
+    },
+    "platform": "web",
+    "pdf_mode": "path"
+  }'
+```
+
+URL + login via env refs (preferred — never put passwords in the JSON body or logs):
+
+```bash
+export MIZZOU_USER='…'
+export MIZZOU_PASSWORD='…'
+curl -sS -X POST http://127.0.0.1:8788/v1/validate \
+  -H "Authorization: Bearer $APP_VALIDATOR_API_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+    "brief": {
+      "app_name": "Mizzou",
+      "app_type": "web",
+      "base_url": "https://mizzou-stage-web.virtualintros.com/"
+    },
+    "platform": "web",
+    "login": {
+      "username_env": "MIZZOU_USER",
+      "password_env": "MIZZOU_PASSWORD"
+    },
+    "pdf_mode": "path"
+  }'
+```
+
+With a sheet (optional):
+
 ```bash
 curl -sS -X POST http://127.0.0.1:8788/v1/validate \
   -H "Authorization: Bearer $APP_VALIDATOR_API_TOKEN" \
@@ -63,7 +105,7 @@ curl -sS -X POST http://127.0.0.1:8788/v1/validate \
   }'
 ```
 
-Full OpenAPI-ish contract and Custom GPT setup: see the Project doc `docs/app-validator-http-api.md` (in the Planner Agent store) or ask the team for that path.
+Full OpenAPI-ish contract: Project store `docs/app-validator-http-api.md`.
 
 ## Deploy (team hosting)
 
