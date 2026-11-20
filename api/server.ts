@@ -9,12 +9,24 @@ import { timingSafeEqual } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import type { AuthInput } from "../bot/lib/auth";
 import { runValidationPipeline } from "../bot/lib/pipeline";
+import { runSimpleValidate } from "../bot/lib/simple-validate";
 import type { ApplicationBrief, ColumnMapping, MobilePlatform } from "../bot/lib/types";
 import { redactSecrets } from "../bot/lib/redact";
+
+/** Headed Chrome is the default for SPA explore; set APP_VALIDATOR_HEADED=0 to disable. */
+if (!process.env.APP_VALIDATOR_HEADED) process.env.APP_VALIDATOR_HEADED = "1";
 
 const PORT = Number(process.env.APP_VALIDATOR_API_PORT ?? process.env.PORT ?? 8788);
 const HOST = process.env.APP_VALIDATOR_API_HOST ?? "127.0.0.1";
 const TOKEN = process.env.APP_VALIDATOR_API_TOKEN ?? "";
+
+type SimpleValidateBody = {
+  url: string;
+  username?: string;
+  password?: string;
+  app_name?: string;
+  pdf_mode?: "base64" | "path" | "both";
+};
 
 type ValidateBody = {
   brief: ApplicationBrief;
@@ -101,9 +113,35 @@ function openApiDoc() {
           responses: { "200": { description: "ok" } },
         },
       },
+      "/v1/validate/simple": {
+        post: {
+          summary: "URL + optional credentials → explore → PDF",
+          security: [{ bearerAuth: [] }],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/SimpleValidateRequest" },
+              },
+            },
+          },
+          responses: {
+            "200": {
+              description: "Validation completed",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/ValidateResponse" },
+                },
+              },
+            },
+            "401": { description: "Unauthorized" },
+            "400": { description: "Bad request" },
+          },
+        },
+      },
       "/v1/validate": {
         post: {
-          summary: "Run validation suite",
+          summary: "Run validation suite (full brief + optional Excel)",
           security: [{ bearerAuth: [] }],
           requestBody: {
             required: true,
@@ -133,6 +171,17 @@ function openApiDoc() {
         bearerAuth: { type: "http", scheme: "bearer" },
       },
       schemas: {
+        SimpleValidateRequest: {
+          type: "object",
+          required: ["url"],
+          properties: {
+            url: { type: "string", format: "uri", example: "https://example.com/" },
+            username: { type: "string", description: "Optional. Never logged or written to PDF." },
+            password: { type: "string", description: "Optional. Never logged or written to PDF." },
+            app_name: { type: "string", description: "Optional display name (defaults from hostname)." },
+            pdf_mode: { type: "string", enum: ["base64", "path", "both"], default: "path" },
+          },
+        },
         ValidateRequest: {
           type: "object",
           required: ["brief"],
@@ -208,6 +257,77 @@ function writeSheetBase64(b64: string, filename: string): string {
   return dest;
 }
 
+function sendPipelineResult(res: ServerResponse, result: Awaited<ReturnType<typeof runValidationPipeline>>): void {
+  if (!result.ok) {
+    json(res, 400, {
+      ok: false,
+      error: result.error,
+      issues: result.issues,
+      run_id: result.run_id,
+      platform: result.platform,
+    });
+    return;
+  }
+
+  json(res, 200, {
+    ok: true,
+    run_id: result.run_id,
+    platform: result.platform,
+    catalog_count: result.catalog_count,
+    summary: result.summary,
+    cases: result.suite?.cases.map((c) => ({
+      test_id: c.test_id,
+      test_case_name: c.test_case_name,
+      status: c.status,
+      severity: c.severity,
+      source: c.source,
+      failure_analysis: c.failure_analysis,
+      blocked_reason: c.blocked_reason,
+      logs: c.logs,
+      has_screenshot: Boolean(c.screenshot),
+      screenshot_blocked_reason: c.screenshot_blocked_reason,
+    })),
+    pdf_path: result.pdf_path,
+    pdf_base64: result.pdf_base64,
+    pdf_bytes: result.pdf_bytes,
+  });
+}
+
+async function handleSimpleValidate(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (!requireAuth(req, res)) return;
+  let body: SimpleValidateBody;
+  try {
+    const raw = await readBody(req);
+    body = JSON.parse(raw.toString("utf8")) as SimpleValidateBody;
+  } catch {
+    json(res, 400, { error: "invalid_json", message: "Body must be JSON." });
+    return;
+  }
+  if (!body?.url || typeof body.url !== "string") {
+    json(res, 400, { error: "invalid_url", message: "url is required." });
+    return;
+  }
+
+  const hasCreds = Boolean(body.username?.trim() && body.password);
+  logLine(`validate/simple start url_host=${safeHost(body.url)} login=${hasCreds ? "yes" : "no"}`);
+  const result = await runSimpleValidate({
+    url: body.url,
+    username: body.username,
+    password: body.password,
+    app_name: body.app_name,
+    pdf_mode: body.pdf_mode ?? "path",
+  });
+  sendPipelineResult(res, result);
+}
+
+function safeHost(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "invalid";
+  }
+}
+
 async function handleValidate(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (!requireAuth(req, res)) return;
   let body: ValidateBody;
@@ -266,39 +386,7 @@ async function handleValidate(req: IncomingMessage, res: ServerResponse): Promis
     login,
   });
 
-  if (!result.ok) {
-    json(res, 400, {
-      ok: false,
-      error: result.error,
-      issues: result.issues,
-      run_id: result.run_id,
-      platform: result.platform,
-    });
-    return;
-  }
-
-  json(res, 200, {
-    ok: true,
-    run_id: result.run_id,
-    platform: result.platform,
-    catalog_count: result.catalog_count,
-    summary: result.summary,
-    cases: result.suite?.cases.map((c) => ({
-      test_id: c.test_id,
-      test_case_name: c.test_case_name,
-      status: c.status,
-      severity: c.severity,
-      source: c.source,
-      failure_analysis: c.failure_analysis,
-      blocked_reason: c.blocked_reason,
-      logs: c.logs,
-      has_screenshot: Boolean(c.screenshot),
-      screenshot_blocked_reason: c.screenshot_blocked_reason,
-    })),
-    pdf_path: result.pdf_path,
-    pdf_base64: result.pdf_base64,
-    pdf_bytes: result.pdf_bytes,
-  });
+  sendPipelineResult(res, result);
 }
 
 const server = createServer(async (req, res) => {
@@ -310,6 +398,10 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "GET" && (url.pathname === "/openapi.json" || url.pathname === "/v1/openapi.json")) {
       json(res, 200, openApiDoc());
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/v1/validate/simple") {
+      await handleSimpleValidate(req, res);
       return;
     }
     if (req.method === "POST" && url.pathname === "/v1/validate") {
@@ -325,5 +417,7 @@ const server = createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
   logLine(`app-validator API listening on http://${HOST}:${PORT}`);
-  if (!TOKEN) logLine("WARNING: APP_VALIDATOR_API_TOKEN is unset; /v1/validate will return 503.");
+  if (!TOKEN) {
+    logLine("WARNING: APP_VALIDATOR_API_TOKEN is unset; /v1/validate and /v1/validate/simple will return 503.");
+  }
 });

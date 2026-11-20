@@ -6,7 +6,8 @@
   "scripts": {
     "check": "tsc --noEmit",
     "dev": "agent-sdk dev",
-    "api": "npx --yes tsx api/server.ts"
+    "api": "npx --yes tsx api/server.ts",
+    "validate": "npx --yes tsx api/validate-cli.ts"
   },
   "dependencies": {
     "@grok/agent-sdk": "^0.7.0",

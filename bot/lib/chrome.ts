@@ -37,10 +37,14 @@ export function resolveChromeExecutable(path: string): string | undefined {
   return undefined;
 }
 
-/** True when APP_VALIDATOR_HEADED is 1/true/yes — show a real Chrome window. */
+/**
+ * Show a real Chrome window for interactive SPA/CDP sessions.
+ * Default is headed (1). Set APP_VALIDATOR_HEADED=0/false/headless to disable.
+ */
 export function isChromeHeaded(): boolean {
-  const v = (process.env.APP_VALIDATOR_HEADED ?? "").trim().toLowerCase();
-  return v === "1" || v === "true" || v === "yes" || v === "headed";
+  const v = (process.env.APP_VALIDATOR_HEADED ?? "1").trim().toLowerCase();
+  if (v === "0" || v === "false" || v === "no" || v === "headless") return false;
+  return true;
 }
 
 /**
