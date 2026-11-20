@@ -1,12 +1,51 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
+import { basename, join } from "node:path";
+
+/** Inner MacOS binary names for common Chromium-family .app bundles. */
+const MAC_APP_BINARIES = [
+  "Google Chrome",
+  "Chromium",
+  "Google Chrome Canary",
+  "Google Chrome for Testing",
+  "Microsoft Edge",
+] as const;
+
+/**
+ * If `path` is a macOS .app bundle (ends with `.app`), resolve to the
+ * executable under Contents/MacOS/. Otherwise return `path` when it exists.
+ */
+export function resolveChromeExecutable(path: string): string | undefined {
+  const trimmed = path.trim();
+  if (!trimmed) return undefined;
+
+  const normalized = trimmed.replace(/\/+$/, "");
+  if (/\.app$/i.test(normalized)) {
+    const macOsDir = join(normalized, "Contents", "MacOS");
+    // Prefer binary matching the .app name, then known Chromium-family names.
+    const appName = basename(normalized, ".app");
+    const ordered = [appName, ...MAC_APP_BINARIES.filter((n) => n !== appName)];
+    for (const name of ordered) {
+      const candidate = join(macOsDir, name);
+      if (existsSync(candidate)) return candidate;
+    }
+    return undefined;
+  }
+
+  if (existsSync(normalized)) return normalized;
+  return undefined;
+}
 
 /** Resolve a Chrome/Chromium binary, including common macOS app paths. */
 export function findChromeBinary(): string | undefined {
   if (process.env.APP_VALIDATOR_FORCE_CURL === "1") return undefined;
-  if (process.env.CHROME_PATH && existsSync(process.env.CHROME_PATH)) {
-    return process.env.CHROME_PATH;
+
+  const fromEnv = process.env.CHROME_PATH?.trim();
+  if (fromEnv) {
+    const resolved = resolveChromeExecutable(fromEnv);
+    if (resolved) return resolved;
   }
+
   const whichCandidates = [
     "google-chrome",
     "google-chrome-stable",
@@ -16,17 +55,38 @@ export function findChromeBinary(): string | undefined {
   ];
   for (const bin of whichCandidates) {
     const which = spawnSync("which", [bin], { encoding: "utf8" });
-    if (which.status === 0 && which.stdout.trim()) return which.stdout.trim();
+    if (which.status === 0 && which.stdout.trim()) {
+      const resolved = resolveChromeExecutable(which.stdout.trim());
+      if (resolved) return resolved;
+    }
   }
-  const macPaths = [
+
+  const home = process.env.HOME ?? "";
+  const macBundles = [
+    "/Applications/Google Chrome.app",
+    "/Applications/Chromium.app",
+    "/Applications/Google Chrome Canary.app",
+    home ? join(home, "Applications", "Google Chrome.app") : "",
+    home ? join(home, "Applications", "Chromium.app") : "",
+    home ? join(home, "Applications", "Google Chrome Canary.app") : "",
+  ];
+  for (const bundle of macBundles) {
+    if (!bundle) continue;
+    const resolved = resolveChromeExecutable(bundle);
+    if (resolved) return resolved;
+  }
+
+  // Also accept pre-resolved inner binaries (legacy hard-coded paths).
+  const macBinaries = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
     "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
-    `${process.env.HOME ?? ""}/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`,
+    home ? join(home, "Applications", "Google Chrome.app", "Contents", "MacOS", "Google Chrome") : "",
   ];
-  for (const p of macPaths) {
+  for (const p of macBinaries) {
     if (p && existsSync(p)) return p;
   }
+
   return undefined;
 }
 

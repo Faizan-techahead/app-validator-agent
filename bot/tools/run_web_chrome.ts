@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { prompt } from "@grok/agent-sdk";
 import { defineTool } from "@grok/agent-sdk/tools";
 import * as z from "zod/v4";
+import { findChromeBinary } from "../lib/chrome";
 import { redactLogLines } from "../lib/redact";
 import { captureChromeScreenshot } from "../lib/screenshots";
 import type { CaseResult, FailureScreenshot, NormalizedCase } from "../lib/types";
@@ -18,17 +19,7 @@ const CaseSchema = z.object({
 });
 
 function findChrome(): string | undefined {
-  const candidates = [
-    "google-chrome",
-    "google-chrome-stable",
-    "chromium",
-    "chromium-browser",
-  ];
-  for (const bin of candidates) {
-    const which = spawnSync("which", [bin], { encoding: "utf8" });
-    if (which.status === 0 && which.stdout.trim()) return which.stdout.trim();
-  }
-  return undefined;
+  return findChromeBinary();
 }
 
 function fetchViaCurl(url: string): { ok: boolean; excerpt: string; error?: string; log: string[] } {
